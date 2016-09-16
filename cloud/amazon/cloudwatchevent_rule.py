@@ -28,11 +28,14 @@ requirements:
   - python >= 2.6
   - boto3
 notes:
-  - A rule must contain at least an I(event_pattern) or I(schedule_expression). A
-    rule can have both an I(event_pattern) and a I(schedule_expression), in which
-    case the rule will trigger on matching events as well as on a schedule.
+  - A rule must contain at least an I(event_pattern) or I(schedule_expression).
+    A rule can have both an I(event_pattern) and a I(schedule_expression), in
+    which case the rule will trigger on matching events as well as on a
+    schedule.
   - When specifying targets, I(input) and I(input_path) are mutually-exclusive
     and optional parameters.
+  - When specifying targets, the value of I(input) can either be a JSON string
+    or a dictionary value
 options:
   name:
     description:
@@ -69,7 +72,7 @@ options:
         form C({ id: [string], arn: [string], input: [valid JSON string], input_path: [valid JSONPath string] }).
         I(id) [required] is the unique target assignment ID. I(arn) (required)
         is the Amazon Resource Name associated with the target. I(input)
-        (optional) is a JSON object that will override the event data when
+        (optional) is a JSON string that will override the event data when
         passed to the target.  I(input_path) (optional) is a JSONPath string
         (e.g. C($.detail)) that specifies the part of the event data to be
         passed to the target. If neither I(input) nor I(input_path) is
@@ -111,6 +114,9 @@ targets:
     type: list
     sample: "[{ 'arn': 'arn:aws:lambda:us-east-1:123456789012:function:MyFunction', 'id': 'MyTargetId' }]"
 '''
+
+import json
+import botocore
 
 
 class CloudWatchEventRule(object):
@@ -221,7 +227,16 @@ class CloudWatchEventRule(object):
                 'Arn': target['arn']
             }
             if 'input' in target:
-                target_request['Input'] = target['input']
+                if isinstance(target['input'], basestring):
+                    # If input is a string, we'll assume it's well-
+                    # formatted JSON per the spec and pass it
+                    # straight through
+                    input_ = target['input']
+                else:
+                    # If it's not a string (e.g. a dict),
+                    # serlialize it as JSON
+                    input_ = json.dumps(target['input'])
+                target_request['Input'] = input_
             if 'input_path' in target:
                 target_request['InputPath'] = target['input_path']
             targets_request.append(target_request)
@@ -233,7 +248,8 @@ class CloudWatchEventRule(object):
 
 
 class CloudWatchEventRuleManager(object):
-    RULE_FIELDS = ['name', 'event_pattern', 'schedule_expression', 'description', 'role_arn']
+    RULE_FIELDS = ['name', 'event_pattern', 'schedule_expression',
+                   'description', 'role_arn']
 
     def __init__(self, rule, targets):
         self.rule = rule
@@ -323,16 +339,26 @@ class CloudWatchEventRuleManager(object):
         ])
 
     def _targets_to_put(self):
-        """Returns a list of targets that need to be updated or added remotely"""
-        remote_targets = self.rule.list_targets()
-        return [t for t in self.targets if t not in remote_targets]
+        """
+        Returns a list of targets that need to be updated or added remotely
+        """
+        remote_targets = self._remote_targets()
+        targets_to_put = []
+        for target in self.targets:
+            if target['id'] in remote_targets:
+                if not self._target_matches_aws(target,
+                                                remote_targets[target['id']]):
+                    targets_to_put.append(target)
+            else:
+                targets_to_put.append(target)
+        return targets_to_put
 
     def _remote_target_ids_to_remove(self):
         """Returns a list of targets that need to be removed remotely"""
         target_ids = [t['id'] for t in self.targets]
-        remote_targets = self.rule.list_targets()
+        remote_target_ids = self._remote_targets().keys()
         return [
-            rt['id'] for rt in remote_targets if rt['id'] not in target_ids
+            rt_id for rt_id in remote_target_ids if rt_id not in target_ids
         ]
 
     def _remote_state(self):
@@ -341,6 +367,69 @@ class CloudWatchEventRuleManager(object):
         if not description:
             return
         return description['state']
+
+    def _remote_targets(self):
+        """Returns a dict (by target id) of remote targets from AWS"""
+        return dict([(t['id'], t) for t in self.rule.list_targets()])
+
+    def _target_matches_aws(self, this_target, remote_target):
+        """
+        Checks if the target data matches the corresponding target
+        in AWS
+        """
+        if this_target['id'] != remote_target['id']:
+            # don't try to compare targets with different ids
+            raise ValueError("Can't compare targets with different IDs")
+
+        # Compare ARNs
+        if this_target['arn'] != remote_target['arn']:
+            # arn values don't match
+            return False
+
+        # Compare inputs
+        if 'input' in this_target:
+            if 'input' not in remote_target:
+                # input is in this target not in remote
+                return False
+
+            if isinstance(this_target['input'], dict):
+                # If input is a dict, we'll use the value directly
+                # since the remote input value it'll be compared
+                # against will also be a dict
+                this_target_input = this_target['input']
+            else:
+                # If it's not a dict we'll assume it's a string-like
+                # object that can be passed to json.loads
+                this_target_input = json.loads(this_target['input'])
+
+            # The remote target is a JSON string, convert it here to
+            # a dict to support comparison
+            remote_target_input = json.loads(remote_target['input'])
+
+            if this_target_input != remote_target_input:
+                # input values don't match
+                return False
+        else:
+            if 'input' in remote_target:
+                # input is not in this target but it is in remote
+                return False
+
+        # Compare input paths
+        if 'input_path' in this_target:
+            if 'input_path' not in remote_target:
+                # input_path is in this target but not in remote
+                return False
+
+            if this_target['input_path'] != remote_target['input_path']:
+                # input paths don't match
+                return False
+        else:
+            if 'input_path' in remote_target:
+                # input_path is not in this target but it is in remote
+                return False
+
+        # Targets match if they survived all our tests
+        return True
 
 
 def get_cloudwatchevents_client(module):
@@ -378,7 +467,8 @@ def main():
         module.fail_json(msg='boto3 required for this module')
 
     rule_data = dict(
-        [(rf, module.params.get(rf)) for rf in CloudWatchEventRuleManager.RULE_FIELDS]
+        [(rf, module.params.get(rf))
+         for rf in CloudWatchEventRuleManager.RULE_FIELDS]
     )
     targets = module.params.get('targets')
     state = module.params.get('state')
